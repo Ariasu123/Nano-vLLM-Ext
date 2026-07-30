@@ -1,4 +1,3 @@
-# 【这个文件做什么】
 # LLMEngine 是用户 API 与底层 GPU 推理代码之间的“总指挥”。
 # 它本身不实现 Transformer 计算，而是负责：
 # 1. 把 prompt 转成 Sequence 请求对象；
@@ -6,10 +5,7 @@
 # 3. 让 ModelRunner 在 GPU 上执行模型；
 # 4. 重复以上过程，直到全部请求完成；
 # 5. 把生成的 token id 解码回字符串。
-#
-# 【建议的阅读位置】
-# 在 example.py 之后阅读本文件。读完 generate() 和 step() 后，再读 sequence.py 和 scheduler.py。
-#
+
 # 【两个最重要的推理阶段】
 # Prefill（预填充）：一次处理 prompt 中的多个 token，建立 KV Cache。
 # Decode（逐 token 解码）：之后每轮每个请求只输入最新的一个 token，并预测下一个 token。
@@ -85,7 +81,7 @@ class LLMEngine:
             p.join()
 
     # 把一个新请求转换成 Sequence 并放入 Scheduler 的等待队列。
-    #
+    
     # prompt 可以是：
     # - str：普通字符串，例如 "Hello"；
     # - list[int]：已经分好词的 token id，例如 [9707]。
@@ -126,7 +122,7 @@ class LLMEngine:
     def is_finished(self):
         return self.scheduler.is_finished()
 
-    # 面向用户的批量生成接口。
+    # 批量生成接口。
     # prompts 是多个字符串或多个 token id 列表；
     # sampling_params 可以是共用配置，也可以是逐请求配置列表。
     def generate(
@@ -139,7 +135,6 @@ class LLMEngine:
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
 
         # 如果只传入一个 SamplingParams，就让所有 prompt 共用它。
-        # 这里不会修改 SamplingParams，因此共享同一个对象是安全的。
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
 

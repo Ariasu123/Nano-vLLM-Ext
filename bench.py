@@ -1,4 +1,3 @@
-# 【这个文件做什么】
 # 这是吞吐量 benchmark（基准测试），用于测量 Nano-vLLM 每秒能生成多少 token。
 # 它直接构造随机 token id，避免分词器耗时影响 GPU 推理结果。
 import os

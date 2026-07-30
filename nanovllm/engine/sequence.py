@@ -1,13 +1,10 @@
-# 【这个文件做什么】
 # Sequence 表示“一条正在生成的请求”。可以把它理解成一张请求进度表：
 # 它记录输入和已生成的 token、当前状态、采样参数，以及 token 对应的 KV Cache 块。
 #
 # 【为什么需要单独的 Sequence】
 # 调度器每轮只选择一部分请求送入 GPU。所有需要跨轮保存的状态都放在 Sequence 中，
 # 这样 Scheduler 只负责决定“谁运行”，ModelRunner 只负责“如何在 GPU 上运行”。
-#
-# 【建议的阅读位置】
-# 在 LLMEngine.add_request() 之后阅读，再继续读 scheduler.py。
+
 from copy import copy
 from enum import Enum, auto
 from itertools import count
@@ -17,22 +14,19 @@ from nanovllm.sampling_params import SamplingParams
 
 class SequenceStatus(Enum):
     # Enum（枚举）表示变量只能从固定选项中取值。
-    # auto() 会自动生成互不相同的内部值，我们只关心 WAITING 等名称。
+    # auto() 会自动生成递增的值，我们只关心 WAITING 等名称。
     WAITING = auto()
     RUNNING = auto()
     FINISHED = auto()
 
 
 class Sequence:
-    # 类属性由所有 Sequence 对象共享。LLMEngine 初始化时会把它改成实际配置值。
     block_size = 256
 
     # count() 是无限计数器，每次 next(counter) 依次得到 0、1、2……
     # 它用于给请求分配唯一且递增的 seq_id。
     counter = count()
 
-    # token_ids 是 prompt 的整数列表。
-    # sampling_params = SamplingParams() 是默认配置；本函数只读取它，不修改它。
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
         # seq_id 不仅区分请求，LLMEngine 最后还会用它恢复提交顺序。
         self.seq_id = next(Sequence.counter)
@@ -41,30 +35,17 @@ class Sequence:
         # copy 创建浅拷贝。token id 都是整数，因此浅拷贝已经足够。
         # 后面 append 新 token 时，不会意外修改用户传入的原列表。
         self.token_ids = copy(token_ids)
-
-        # last_token 是 Decode 阶段真正送进模型的 token。
-        self.last_token = token_ids[-1]
-
-        # 当前完整长度，包含 prompt 和已经生成的 token。
-        self.num_tokens = len(self.token_ids)
-
-        # prompt 长度创建后不再变化，因此可以据此计算生成部分的长度。
-        self.num_prompt_tokens = len(token_ids)
-
-        # 已经拥有有效 KV Cache、不必重复计算的 token 数。
-        self.num_cached_tokens = 0
-
-        # 调度器为“当前这一轮”安排的 token 数；执行完后会重新清零。
-        self.num_scheduled_tokens = 0
-
-        # True 表示正在处理 prompt；False 表示已经进入逐 token Decode。
+        self.last_token = token_ids[-1]          # last_token 是 Decode 阶段真正送进模型的 token。
+        self.num_tokens = len(self.token_ids)    # 当前完整长度，包含 prompt 和已经生成的 token
+        self.num_prompt_tokens = len(token_ids)  # prompt 长度创建后不再变化，因此可以据此计算生成部分的长度。
+        self.num_cached_tokens = 0               # 已经拥有有效 KV Cache、不必重复计算的 token 数。
+        self.num_scheduled_tokens = 0            # 调度器为“当前这一轮”安排的 token 数；执行完后会重新清零。
         self.is_prefill = True
 
         # block_table 是“逻辑块编号 -> GPU 物理块编号”的映射。
         # 例：逻辑块 0、1 被分配到物理块 7、3，则 block_table == [7, 3]。
         self.block_table = []
 
-        # 将采样参数保存为简单字段，后续代码读取更直接。
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -123,7 +104,7 @@ class Sequence:
         self.num_tokens += 1
 
     # __getstate__ / __setstate__ 控制对象被 pickle（序列化）时保存哪些数据。
-    # 序列化就是把 Python 对象转换成字节，以便通过共享内存传给其他进程。
+    # 序列化就是把 Python 对象转换成字节，以便通过共享内存传给其他进程（TP架构进行传递到子进程）。
     def __getstate__(self):
         # Prefill 要读取 prompt 片段，因此发送 token_ids；
         # Decode 只使用 last_token，因此只发一个整数，减少通信量。
