@@ -1,7 +1,6 @@
-# 【这个文件做什么】
 # RMSNorm 用来控制隐藏向量的数值尺度，让深层网络更稳定。
 # 它计算每个 token 向量的均方根，再将向量除以该尺度，最后乘可学习权重。
-#
+
 # 与 LayerNorm 相比，RMSNorm 不减均值，只按均方根缩放。
 # 本实现还有“残差相加 + RMSNorm”的融合版本，可减少一次显存读写。
 import torch
@@ -64,7 +63,6 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # `Tensor | None` 表示 residual 可以是 Tensor，也可以不提供。
         if residual is None:
             return self.rms_forward(x)
         else:

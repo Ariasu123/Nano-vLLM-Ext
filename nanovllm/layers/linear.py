@@ -1,5 +1,4 @@
-# 【这个文件做什么】
-# 这里实现模型的张量并行 Linear（线性层）。
+# 实现模型的张量并行 Linear（线性层）。
 # 普通线性层计算 y = x @ W^T + bias；当 W 太大时，可把它切到多张 GPU。
 #
 # 【用两张 GPU 举例】
@@ -10,9 +9,7 @@
 # 【两个通信操作】
 # all_reduce：每张 GPU 都提供一个 Tensor，将它们相加后，每张 GPU 都得到结果。
 # gather：收集每张 GPU 的不同分片，只让指定 GPU 得到完整结果。
-#
-# 【建议的阅读方式】
-# 先读 ColumnParallelLinear 和 RowParallelLinear 的图景，再看融合 QKV 权重如何加载。
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -56,7 +53,7 @@ class LinearBase(nn.Module):
             # 正式注册一个值为 None 的参数，使 state_dict 等 PyTorch 机制知道本层没有 bias。
             self.register_parameter("bias", None)
 
-    # 基类不知道具体如何计算，子类必须覆盖 forward。
+    # 基类留下占位，子类必须重写forward。
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 

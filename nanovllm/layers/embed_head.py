@@ -1,8 +1,7 @@
-# 【这个文件做什么】
 # 这里实现词表并行的 Embedding 和 LM Head。
-# 两者其实使用形状相同的权重 [vocab_size, hidden_size]：
-# Embedding 用 token id 查一行；LM Head 用隐藏向量与每一行做点积，得到词表 logits。
-#
+# 两者形状相同[vocab_size, hidden_size]：
+
+
 # 【词表并行示例】
 # 假设词表有 1000 个 token、两张 GPU：
 # rank 0 保存 token 0~499，rank 1 保存 token 500~999。
@@ -77,7 +76,6 @@ class ParallelLMHead(VocabParallelEmbedding):
         embedding_dim: int,
         bias: bool = False,
     ):
-        # 当前实现没有并行 LM Head bias。
         assert not bias
         super().__init__(num_embeddings, embedding_dim)
 

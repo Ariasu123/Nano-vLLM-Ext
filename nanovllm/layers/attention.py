@@ -1,15 +1,8 @@
-# 【这个文件做什么】
-# 这里完成自注意力中最核心的计算，并管理每一层的 K/V Cache：
+# 完成自注意力中最核心的计算，并管理每一层的 K/V Cache：
 # 1. 使用自定义 Triton 内核把本轮新 K/V 写到指定物理槽位；
 # 2. Prefill 时调用支持变长序列的 FlashAttention；
 # 3. Decode 时从分页 KV Cache 读取完整历史。
-#
-# 【Q、K、V 的直观理解】
-# Q（Query）表示“当前 token 想寻找什么信息”；
-# K（Key）表示“每个历史 token 能提供什么线索”；
-# V（Value）表示“真正要汇总的内容”。
-# Q 与 K 的相似度经过 softmax 后成为权重，再对 V 做加权求和。
-#
+
 # 【Triton 与 FlashAttention】
 # Triton 是编写 GPU 内核的 Python 风格语言；这里用它完成简单而高效的缓存写入。
 # FlashAttention 是优化后的注意力实现，数学结果与普通 Attention 一致，但减少显存读写。

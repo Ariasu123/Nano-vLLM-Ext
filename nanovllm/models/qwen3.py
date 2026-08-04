@@ -1,7 +1,3 @@
-# 【这个文件做什么】
-# 这里用 PyTorch 重新搭建了 Qwen3 的推理结构。
-# 权重并不在代码里，而是由 loader.py 从模型目录加载。
-#
 # 【一枚 token 的完整路线】
 # token id
 # -> Embedding（查表得到向量）
@@ -9,15 +5,13 @@
 # -> 最终 RMSNorm
 # -> LM Head（把向量投影为整个词表的 logits）
 # -> Sampler 选择下一个 token。
-#
+
 # 【常见形状】
 # 本项目为了配合变长批处理，把不同请求的 token 拼成一维：
 # input_ids: [num_tokens]
 # hidden_states: [num_tokens, hidden_size]
 # Q/K/V: [num_tokens, num_heads, head_dim]
-#
-# 【建议的阅读位置】
-# 先关注每个 forward 中 Tensor 如何改变形状，不必一开始就研究张量并行权重加载。
+
 import torch
 from torch import nn
 import torch.distributed as dist

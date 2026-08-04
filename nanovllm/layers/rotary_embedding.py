@@ -1,9 +1,6 @@
-# 【这个文件做什么】
 # RoPE（Rotary Position Embedding，旋转位置编码）让 Attention 知道 token 的先后位置。
 # 它把 Q/K 向量的每两个相关分量看成二维坐标，再按位置对应角度旋转。
-#
-# 直观上：相同内容出现在不同位置时会得到不同方向的 Q/K；
-# 两个位置之间的相对距离会体现在旋转角度差中。
+
 from functools import lru_cache
 import torch
 from torch import nn

@@ -1,4 +1,3 @@
-# 【这个文件做什么】
 # 模型输出 logits（词表中每个 token 的原始分数），Sampler 将它们变成概率，
 # 再根据概率随机选择每条请求的下一个 token。
 #
@@ -19,10 +18,8 @@ class Sampler(nn.Module):
         # softmax 将每行分数转换为总和为 1 的概率。
         probs = torch.softmax(logits, dim=-1)
 
-        # 下面是“指数竞赛”采样技巧，与按照 probs 做分类采样等价：
         # 为每个候选 token 生成指数随机数，用 概率/随机数 得到带噪分数，再取最大值。
         # clamp_min 防止随机数过小造成除零或数值溢出。
-        sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
-
         # argmax 返回每行最大值的下标，也就是采样出的 token id。
+        sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
         return sample_tokens
