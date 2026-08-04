@@ -20,19 +20,19 @@ Nano-vLLM-Ext is an independently maintained extension of Nano-vLLM.
 
 ![Qwen inference architecture](assets/Qwen_arch.png)
 
-See how the Qwen inference path connects embeddings, attention, KV cache, and the language-model head.
+Input token IDs first pass through token embeddings and RoPE, then flow through repeated Decoder layers before the final normalization and LM head produce next-token logits. Within each layer, GQA reuses a compact KV cache for attention, while the SwiGLU feed-forward network transforms the hidden states. The diagram shows how these components form one end-to-end inference path.
 
 ### Engine and KV Cache
 
 ![Engine and KV cache architecture](assets/Engine.png)
 
-Learn how request scheduling, KV cache management, and multi-process execution work together.
+Incoming requests move from the scheduler's waiting queue to the running queue and are assembled into execution batches. BlockManager maintains each sequence's block table, physical block pool, and Prefix Cache so KV-cache blocks can be allocated, reused, or released. Rank 0 coordinates scheduling and commands, while workers execute their model shards with the required block tables.
 
 ### Tensor Parallel Execution
 
 ![Tensor parallel execution flow](assets/TP-expanded.png)
 
-Follow parameter sharding, collective communication, and sampling across tensor-parallel ranks.
+Checkpoint weights are split across tensor-parallel ranks, with column-parallel and row-parallel layers distributing the model computation. During Prefill and Decode, every rank runs its local shard and uses `all_reduce` where partial activations must be combined. Rank 0 gathers vocabulary logits, samples the next token, and returns the result; worker ranks complete only their assigned shard work.
 
 ## Upstream Acknowledgement
 
