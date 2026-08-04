@@ -1,4 +1,3 @@
-# 【这个文件做什么】
 # Scheduler（调度器）决定“这一轮让哪些请求进入 GPU，以及每条请求处理几个 token”。
 # 它不执行神经网络，只管理请求队列和 KV Cache 资源。
 #
@@ -10,9 +9,7 @@
 # 【两个队列】
 # waiting：等待 Prefill，或被抢占后等待重新计算的请求。
 # running：prompt 已处理完，正在逐 token Decode 的请求。
-#
-# 【建议的阅读位置】
-# 先读 Sequence 中的计数器，再从 schedule() 的 Prefill 分支往下读。
+
 from collections import deque
 
 from nanovllm.config import Config
@@ -82,10 +79,10 @@ class Scheduler:
             if remaining < num_tokens and scheduled_seqs:
                 break
             if not seq.block_table:
-                # 真正修改空闲块、引用计数，并为 seq 创建 block_table。
+                # 真正修改空闲块、引用计数，并为 seq 创建 对应的block_table。
                 self.block_manager.allocate(seq, num_cached_blocks)
 
-            # min 保证本轮不会超过 token 预算。
+            # min 保证本轮不会超过 token 预算。chunked prefill思想
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
@@ -132,6 +129,7 @@ class Scheduler:
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
+        # 释放kv cache
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 

@@ -1,20 +1,17 @@
-# 【这个文件做什么】
 # ModelRunner 是真正驱动 GPU 的执行器。Scheduler 只说“本轮运行哪些 Sequence”，
 # ModelRunner 则把 Python 列表整理成 PyTorch Tensor，执行 Qwen3，并返回新 token。
-#
+
 # 【主要工作】
 # 1. 每张 GPU 创建模型分片并加载相应权重；
 # 2. 多 GPU 时让所有进程执行相同命令；
 # 3. 预热模型并用剩余显存分配 KV Cache；
 # 4. 分别准备 Prefill 和 Decode 的输入；
 # 5. 选择普通 Eager 执行或 CUDA Graph 回放。
-#
+
 # 【Tensor 与 rank】
 # Tensor（张量）可理解为支持 GPU 运算的多维数组。shape=[2,3] 就是 2 行 3 列。
 # 多 GPU 时，每个参与者有一个从 0 开始的编号，叫 rank；参与者总数叫 world_size。
-#
-# 【建议的阅读位置】
-# 先理解 Sequence、Scheduler 和 BlockManager，再重点读 prepare_prefill、prepare_decode 与 run。
+
 import pickle
 import torch
 import torch.distributed as dist

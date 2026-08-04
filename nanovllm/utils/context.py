@@ -1,12 +1,11 @@
-# 【这个文件做什么】
 # Context 保存“当前这一批请求”的公共元数据，例如本轮是 Prefill 还是 Decode、
 # token 应写到哪个 KV Cache 槽位，以及每条请求的块表。
-#
+
 # 【为什么使用全局 Context】
 # Qwen3 有很多层，每层 Attention 都需要相同的批次信息。
 # 如果把这些参数从 Qwen3Model 一层层传到每个 Attention，函数签名会很长。
 # 本项目选择在每次模型前向前设置一次全局 Context，各层需要时直接 get_context()。
-#
+
 # 【注意】
 # 这里的全局变量只在当前进程内共享；张量并行的每个进程都有自己的 _CONTEXT。
 # 每次 run 结束必须 reset_context，否则下一批可能错误使用上一批的块表。
@@ -19,10 +18,9 @@ class Context:
     # @dataclass 会根据这些字段自动生成 __init__ 等常用方法。
     # slots=True 禁止对象随意增加新属性，并能略微减少内存占用。
 
-    # True 表示 Prefill，False 表示 Decode。
     is_prefill: bool = False
 
-    # cu_seqlens_q/k 是多条变长序列的累计边界，长度为 batch_size+1。
+    # cu_seqlens_q/k 是多条变长序列的累计边界，长度为 batch_size+1，带一个结束位置。
     # 它们只在 Prefill 使用。
     cu_seqlens_q: torch.Tensor | None = None
     cu_seqlens_k: torch.Tensor | None = None

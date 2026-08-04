@@ -1,6 +1,5 @@
-# 【这个文件做什么】
 # 模型类只创建了形状正确的空 Parameter，本文件负责从 .safetensors 文件填入真实权重。
-#
+
 # 【为什么不能全部直接 copy】
 # 本实现使用张量并行和融合层：
 # - 完整权重要按 rank 切片；
@@ -46,7 +45,7 @@ def load_model(model: nn.Module, path: str):
                         # 融合层加载器会同时做“选择当前 rank 分片”和“选择 Q/K/V 子区域”。
                         weight_loader(param, f.get_tensor(weight_name), shard_id)
 
-                        # 已找到融合规则，无需继续遍历其他 key。
+                        # 去处理下一个权重
                         break
                 else:
                     # 这是 Python for...else：只有循环没有 break 时才进入 else，
