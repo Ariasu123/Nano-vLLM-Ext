@@ -50,6 +50,13 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
 
+        # ---------- 功能三：benchmark 时间戳（perf_counter 秒）----------
+        # 仅在主进程 scheduler 侧读写，不加入 __getstate__/__setstate__，
+        # 以保持张量并行的 pickle 通信量不变。默认 None 表示尚未打点。
+        self.arrival_time = None       # 请求进入引擎的时刻。
+        self.first_token_time = None   # 生成第一个 token 的时刻（TTFT 终点）。
+        self.finish_time = None        # 请求结束的时刻。
+
     # __len__ 让 len(seq) 等价于 seq.num_tokens。
     def __len__(self):
         return self.num_tokens

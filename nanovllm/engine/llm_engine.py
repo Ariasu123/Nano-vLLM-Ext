@@ -93,19 +93,25 @@ class LLMEngine:
 
         # Sequence 保存这个请求的 token、生成参数、状态和 KV Cache 块表。
         seq = Sequence(prompt, sampling_params)
+        # 记录请求到达时刻（TTFT 起点）；benchmark 需要，正常 generate 不受影响。
+        seq.arrival_time = perf_counter()
         self.scheduler.add(seq)
+        # 返回 seq，便于 benchmark 保留引用、在结束后读取时间戳。
+        return seq
 
     # 执行“一轮”推理，而不是一次完成所有生成。
     # 返回：
     # - outputs：本轮刚刚完成的请求；
     # - num_tokens：用于进度条计算吞吐量的 token 数。
     def step(self):
-        # Scheduler 会返回本轮选中的序列，以及本轮属于 prefill 还是 decode。
+        # Scheduler 会返回本轮选中的序列，以及本轮走 varlen(prefill) 还是固定形状(decode) 路径。
         seqs, is_prefill = self.scheduler.schedule()
 
-        # Prefill 时可能一次处理很多 prompt token，所以把每条序列的本轮 token 数相加。
-        # Decode 时每条序列只有 1 个 token，使用负数只是本项目内部区分两种吞吐量的简写。
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        # 按每条序列的 is_prefill 分别统计 prefill / decode token 数：混批步二者并存，
+        # 不能再用单一符号区分。decode 序列 num_scheduled_tokens==1，prefill 序列为本步 chunk 大小。
+        # 必须在 postprocess 之前统计（postprocess 会把 num_scheduled_tokens 清零）。
+        prefill_tokens = sum(seq.num_scheduled_tokens for seq in seqs if seq.is_prefill)
+        decode_tokens = sum(seq.num_scheduled_tokens for seq in seqs if not seq.is_prefill)
 
         # ModelRunner.run 会准备 GPU tensor、执行 Qwen3 并采样下一个 token。
         # call 还负责在多 GPU 时让所有 rank 执行相同操作。
@@ -116,7 +122,7 @@ class LLMEngine:
 
         # 列表推导式只收集已经结束的请求。
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        return outputs, num_tokens
+        return outputs, prefill_tokens, decode_tokens
 
     # waiting 和 running 队列都为空时，说明没有未完成请求。
     def is_finished(self):
@@ -149,12 +155,13 @@ class LLMEngine:
         # 每次循环只前进一步：长请求会经历 prefill，再经历很多次 decode。
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
-            # 吞吐量 = 本轮处理 token 数 / 本轮耗时，单位为 token/s。
-            if num_tokens > 0:
-                prefill_throughput = num_tokens / (perf_counter() - t)
-            else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
+            output, prefill_tokens, decode_tokens = self.step()
+            dt = perf_counter() - t
+            # 吞吐量 = 本轮处理 token 数 / 本轮耗时，单位为 token/s。混批步二者都非零，各自更新。
+            if prefill_tokens:
+                prefill_throughput = prefill_tokens / dt
+            if decode_tokens:
+                decode_throughput = decode_tokens / dt
             pbar.set_postfix({
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
@@ -170,3 +177,66 @@ class LLMEngine:
         # tokenizer.decode 把 completion token id 还原成可读文字。
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         return outputs
+
+    # benchmark 专用：跑一批请求并汇总性能指标，不返回解码文本。
+    # 指标：TTFT/TPOT 的 P50/P99、prefill/decode 分阶段吞吐、峰值显存，以及调度与 Prefix Cache 统计。
+    def benchmark(
+        self,
+        prompts: list[str] | list[list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+        use_tqdm: bool = False,
+    ) -> dict:
+        from nanovllm.engine.metrics import percentile, compute_ttft, compute_tpot
+
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(prompts)
+
+        # 清零峰值显存统计，保证测到的是本次 benchmark 期间的峰值。
+        self.model_runner.call("reset_peak_memory")
+
+        # 保留每个 seq 的引用，结束后从中读取时间戳（seq 完成后仍存活）。
+        seqs = [self.add_request(p, sp) for p, sp in zip(prompts, sampling_params)]
+
+        pbar = tqdm(total=len(prompts), desc="Benchmarking", dynamic_ncols=True, disable=not use_tqdm)
+        prefill_tokens = decode_tokens = 0
+        prefill_time = decode_time = 0.
+        t_start = perf_counter()
+        while not self.is_finished():
+            t = perf_counter()
+            output, prefill_tokens_step, decode_tokens_step = self.step()
+            dt = perf_counter() - t
+            # 混批步 prefill/decode token 并存：dt 同时计入两侧（都略偏保守），非混批步只命中一侧、与原版一致。
+            if prefill_tokens_step:
+                prefill_tokens += prefill_tokens_step
+                prefill_time += dt
+            if decode_tokens_step:
+                decode_tokens += decode_tokens_step
+                decode_time += dt
+            pbar.update(len(output))
+        pbar.close()
+        wall_time = perf_counter() - t_start
+
+        # 逐请求延迟指标。
+        ttfts, tpots = [], []
+        for seq in seqs:
+            if seq.first_token_time is not None:
+                ttfts.append(compute_ttft(seq.arrival_time, seq.first_token_time))
+                if seq.finish_time is not None:
+                    tpot = compute_tpot(seq.first_token_time, seq.finish_time, seq.num_completion_tokens)
+                    if tpot > 0:
+                        tpots.append(tpot)
+        return {
+            "num_requests": len(prompts),
+            "wall_time_s": wall_time,
+            "ttft_p50_s": percentile(ttfts, 50),
+            "ttft_p99_s": percentile(ttfts, 99),
+            "tpot_p50_s": percentile(tpots, 50),
+            "tpot_p99_s": percentile(tpots, 99),
+            "prefill_throughput_tok_s": prefill_tokens / prefill_time if prefill_time else 0.,
+            "decode_throughput_tok_s": decode_tokens / decode_time if decode_time else 0.,
+            "total_prefill_tokens": prefill_tokens,
+            "total_decode_tokens": decode_tokens,
+            "peak_memory_bytes": self.model_runner.call("get_peak_memory"),
+            "scheduler_stats": self.scheduler.get_stats(),
+            "prefix_cache_stats": self.scheduler.block_manager.get_stats(),
+        }

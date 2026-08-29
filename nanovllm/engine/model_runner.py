@@ -145,6 +145,15 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
+    # benchmark 用：返回本进程 GPU 已分配显存的历史峰值（字节）。
+    # 经 call("get_peak_memory") 调用时取 rank 0 的返回值即可代表整体规模。
+    def get_peak_memory(self) -> int:
+        return torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+
+    # benchmark 用：清零峰值显存统计，确保测量的是本次 benchmark 期间的峰值。
+    def reset_peak_memory(self):
+        torch.cuda.reset_peak_memory_stats()
+
     # 用接近配置上限的虚拟输入执行一次 Prefill。
     # 这不是为了得到有意义的输出，而是为了触发内核编译、显存分配并记录峰值。
     def warmup_model(self):
