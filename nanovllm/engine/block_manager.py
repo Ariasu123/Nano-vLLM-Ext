@@ -8,11 +8,12 @@
 # 【前缀缓存 Prefix Cache】
 # 两个请求如果开头有相同的完整 token 块，它们对应的 K/V 也完全相同，
 # 因此可以让两个请求共享同一个物理块，避免重复 Prefill。
-from collections import deque
+from collections import OrderedDict
 import xxhash
 import numpy as np
 
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.metrics import PrefixCacheStats
 
 
 class Block:
@@ -48,8 +49,11 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int, enable_lru: bool = True):
         self.block_size = block_size
+
+        # enable_lru=True 使用显式 LRU 驱逐；False 回退原版 FIFO，用于对照基线。
+        self.enable_lru = enable_lru
 
         # 创建 num_blocks 个 CPU 管理对象；它们与 GPU 物理块一一对应。
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
@@ -57,11 +61,16 @@ class BlockManager:
         # 字典实现“累计前缀哈希 -> 物理块 id”的快速查询。
         self.hash_to_block_id: dict[int, int] = dict()
 
-        # 刚初始化时全部块都空闲，所以队列包含 0 到 num_blocks-1。
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
+        # 空闲块用 OrderedDict 维护“释放先后顺序”：队首是最久之前释放的块（LRU 端），
+        # 队尾是最近释放的块。相比 deque，它支持 O(1) 按 id 删除（命中重激活时用到）。
+        # 初始化时全部块都空闲，插入顺序为 0..num_blocks-1。
+        self.free_block_ids: OrderedDict[int, None] = OrderedDict.fromkeys(range(num_blocks))
 
         # set（集合）记录正在被至少一个请求使用的块 id，查询复杂度接近 O(1)。
         self.used_block_ids: set[int] = set()
+
+        # Prefix Cache 命中/驱逐统计，仅用于 benchmark 汇总，不参与推理逻辑。
+        self.prefix_stats = PrefixCacheStats(block_size=block_size)
 
     # @classmethod 表示方法接收类 cls，而不是某个实例 self。
     # 本函数不依赖某个 BlockManager 的字段，放在类中只是为了归类。
@@ -83,17 +92,22 @@ class BlockManager:
 
     # 从空闲队列取出一个物理块，并准备让新请求使用。
     def _allocate_block(self) -> int:
-        # popleft 从 deque 左侧取出并删除一个 id。
-        block_id = self.free_block_ids.popleft()
+        # 统一从队首取块：
+        # - FIFO 模式（enable_lru=False）：队首是最久之前释放的块，等价于原 deque.popleft。
+        # - LRU 模式：_deallocate_block 已把“无缓存价值”的块移到队首，因此队首要么是无哈希块
+        #   （复写零损失），要么是最久未用的缓存块（真正的 LRU 驱逐）。
+        block_id = next(iter(self.free_block_ids))
+        del self.free_block_ids[block_id]
         block = self.blocks[block_id]
 
         # 空闲块理论上不应仍有使用者；assert 用来尽早暴露内部状态错误。
         assert block.ref_count == 0
 
-        # 一个已释放块可能保留旧 K/V 供 Prefix Cache 命中。
-        # 现在它将被新内容覆盖，所以必须删除指向它的旧哈希索引。
+        # 一个已释放块可能保留旧 K/V 供 Prefix Cache 命中。现在它将被新内容覆盖：
+        # 若它仍带有效哈希且索引指向自己，说明这是一次真正的缓存驱逐，删除索引并计数。
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
             del self.hash_to_block_id[block.hash]
+            self.prefix_stats.record_eviction()
 
         block.reset()
         self.used_block_ids.add(block_id)
@@ -103,17 +117,20 @@ class BlockManager:
     def _deallocate_block(self, block_id: int):
         assert self.blocks[block_id].ref_count == 0
         self.used_block_ids.remove(block_id)
-        self.free_block_ids.append(block_id)
+        # 回插到队尾，表示“最近释放”。
+        self.free_block_ids[block_id] = None
+
+        # LRU 模式下，无缓存价值的块（hash==-1）移到队首，让它们最先被复用，
+        # 从而尽量保留仍可能命中的缓存块，把驱逐推迟到真正显存不足时。
+        if self.enable_lru and self.blocks[block_id].hash == -1:
+            self.free_block_ids.move_to_end(block_id, last=False)
 
         # 注意：这里故意不清除 block.hash 和 token_ids。
         # 只要该物理块尚未被新内容覆盖，旧 K/V 仍然有效，可被 Prefix Cache 重新激活。
 
-    # 在真正修改状态前，检查一个新请求是否能完整获得所需块。
-    # 返回值：
-    # - -1：可用物理块不足；
-    # - 0：能分配，但没有命中前缀缓存；
-    # - 正整数 n：能分配，并且前 n 个完整逻辑块可直接复用。
-    def can_allocate(self, seq: Sequence) -> int:
+    # 沿前缀逐块匹配 Prefix Cache，返回 (命中的完整前缀块数, 最坏还需新占用的物理块数)。
+    # can_allocate 与 count_cached_prefix_blocks 共用这一个哈希循环，避免逻辑重复。
+    def _match_cached_prefix(self, seq: Sequence) -> tuple[int, int]:
         # -1 作为“还没有前一个块哈希”的哨兵值。
         h = -1
         num_cached_blocks = 0
@@ -138,11 +155,26 @@ class BlockManager:
                 # 正在使用的命中块通过增加引用计数共享，不占用 free 队列中的新块。
                 num_new_blocks -= 1
 
+        return num_cached_blocks, num_new_blocks
+
+    # 在真正修改状态前，检查一个新请求是否能完整获得所需块。
+    # 返回值：
+    # - -1：可用物理块不足；
+    # - 0：能分配，但没有命中前缀缓存；
+    # - 正整数 n：能分配，并且前 n 个完整逻辑块可直接复用。
+    def can_allocate(self, seq: Sequence) -> int:
+        num_cached_blocks, num_new_blocks = self._match_cached_prefix(seq)
+
         # 闲置的缓存命中块仍在 free_block_ids 中，重新启用它也会占掉一个空闲名额，
         # 因此只有“当前已被使用的共享块”能从 num_new_blocks 中减掉。
         if len(self.free_block_ids) < num_new_blocks:
             return -1
         return num_cached_blocks
+
+    # 只返回命中的完整前缀块数，不做分配可行性判断、无任何副作用（不 record_query、不改状态）。
+    # 供 Cache-Aware 调度给多个等待请求打分排序用。
+    def count_cached_prefix_blocks(self, seq: Sequence) -> int:
+        return self._match_cached_prefix(seq)[0]
 
     # 真正为 Sequence 建立 block_table。
     # 调用前必须先通过 can_allocate，避免分配到一半才发现资源不足。
@@ -162,8 +194,9 @@ class BlockManager:
                 block.ref_count += 1
             else:
                 # 该块虽然在空闲队列，但旧 K/V 仍有效；从空闲队列移除并重新激活。
+                # OrderedDict 支持按 id O(1) 删除，优于原 deque.remove 的 O(n) 扫描。
                 block.ref_count = 1
-                self.free_block_ids.remove(block_id)
+                del self.free_block_ids[block_id]
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
 
@@ -173,6 +206,11 @@ class BlockManager:
 
         # 每个命中块都是完整块，所以缓存 token 数 = 命中块数 * 块大小。
         seq.num_cached_tokens = num_cached_blocks * self.block_size
+
+        # 记录一次缓存查询：分母为可被复用的完整前缀块数（末块不参与），分子为命中块数。
+        # 放在 allocate（每个 Sequence 恰好首次分配时调用一次），避免 can_allocate 被反复
+        # 试探调用时重复计数。
+        self.prefix_stats.record_query(max(seq.num_blocks - 1, 0), num_cached_blocks)
 
     # Sequence 完成或被抢占时，释放它对所有物理块的引用。
     def deallocate(self, seq: Sequence):
@@ -188,6 +226,10 @@ class BlockManager:
         # Sequence 已不再拥有任何有效 KV Cache。
         seq.num_cached_tokens = 0
         seq.block_table.clear()
+
+    # 暴露 Prefix Cache 统计给上层（Scheduler → LLMEngine → benchmark）。
+    def get_stats(self) -> PrefixCacheStats:
+        return self.prefix_stats
 
     # 检查下一次 Decode 是否需要新块，以及当前是否有空闲块可用。
     def can_append(self, seq: Sequence) -> bool:
