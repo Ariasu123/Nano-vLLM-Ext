@@ -1,4 +1,3 @@
-# 指标化 benchmark：按“对口场景”对比原版与各优化项，产出可回填简历的真实数字。
 # 每个 (场景, 变体) 单独起子进程跑：进程退出即彻底释放显存，避免上一个变体的权重/KV Cache
 # 残留导致下一个变体分配 KV 块数 <=0；工作负载用固定种子构造，同场景各变体是同一批请求。
 #
@@ -8,10 +7,12 @@
 #                   饥饿：victim 的 token 间隔从"等完所有长 prompt 的 prefill 步"降到"一步"。
 #   prefix       —— 功能二：长共享系统前缀 vs 各自独立前缀，看 Prefix Cache 复用带来的命中率与 TTFT 收益。
 #   lru_pressure —— 功能二：多前缀 + 偏斜复用 + 调低显存制造缓存紧张，对比 FIFO vs LRU 的命中率/驱逐。
+#   cache_aware  —— 功能三：多前缀 round-robin 交错到达 + 压小缓存，对比 FIFO vs LPM 出队顺序的命中率/驱逐。
+#   speculative  —— 功能四：同一 target 模型下 base 关投机 vs spec 开投机，对比 decode 吞吐/TPOT 与接受率。
 #
-# 需要 CUDA GPU。用法：python bench_metrics.py              # 跑全部场景全部变体
-#                     python bench_metrics.py <场景>        # 只跑某场景
-#                     python bench_metrics.py <场景> <变体>  # 子进程内跑单个（内部用）
+# 需要 CUDA GPU。用法：python scripts/bench_metrics.py              # 跑全部场景全部变体
+#                     python scripts/bench_metrics.py <场景>        # 只跑某场景
+#                     python scripts/bench_metrics.py <场景> <变体>  # 子进程内跑单个（内部用）
 import os
 import sys
 import subprocess
@@ -19,8 +20,23 @@ from random import randint, seed, random
 
 from nanovllm import LLM, SamplingParams
 
-MODEL = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+
+def _model_root():
+    # 模型根目录：AutoDL 系统盘（含 $HOME）小，Qwen3-8B ≈16GB 应落数据盘 /root/autodl-tmp；
+    # 非 AutoDL 环境回退 ~/huggingface。可用 MODEL_ROOT 覆盖，与 scripts/env.sh 保持一致。
+    root = os.environ.get("MODEL_ROOT")
+    if not root:
+        root = "/root/autodl-tmp/models" if os.path.isdir("/root/autodl-tmp") else os.path.expanduser("~/huggingface")
+    return root
+
+
+MODEL = os.path.join(_model_root(), "Qwen3-0.6B")
 MAX_MODEL_LEN = 4096
+
+# 功能四：投机场景要一大一小两个模型（共享同一 tokenizer/vocab）。可用环境变量覆盖路径。
+# target 用较大模型放大 decode 单步成本，draft 用小模型 propose，收益才明显。
+SPEC_TARGET = os.path.expanduser(os.environ.get("SPEC_TARGET", os.path.join(_model_root(), "Qwen3-8B")))
+SPEC_DRAFT = os.path.expanduser(os.environ.get("SPEC_DRAFT", os.path.join(_model_root(), "Qwen3-0.6B")))
 
 
 def _sp(max_tokens):
@@ -90,6 +106,17 @@ def build_cache_aware(**_):
     return prompts, sps
 
 
+def build_speculative(**_):
+    # 功能四：中等长度 prompt + 较长输出（每条 128 token），让 decode 阶段占主导——投机解码的收益
+    # 全在 decode（一步 target forward 提交多 token）。两变体同批请求/同种子，唯一差别是是否开投机。
+    seed(0)
+    prompts, sps = [], []
+    for _ in range(64):
+        prompts.append([randint(0, 10000) for _ in range(randint(64, 128))])
+        sps.append(_sp(128))
+    return prompts, sps
+
+
 SCENARIOS = {
     "starvation": {
         "build": build_starvation,
@@ -121,6 +148,23 @@ SCENARIOS = {
                                 enable_cache_aware_schedule=True)},
         },
     },
+    "speculative": {
+        # 功能四：同一 target 模型（SPEC_TARGET），base 关投机 vs spec 开投机（draft=SPEC_DRAFT，K=4）。
+        # 对照 decode 吞吐 / TPOT，并看 spec 的 acceptance_rate / avg_accept_len。
+        "build": build_speculative,
+        # A(base)=CUDA Graph baseline，B(base_eager)=eager baseline，C(spec)=eager 投机。
+        # A vs C 回答「当前完整 serving 配置下开投机是否值得」（混入 CUDA Graph 开/关变量）；
+        # B vs C 才隔离掉该变量、单独回答「投机算法本身有没有收益」——spec path 本就走 eager，只有
+        # 和 eager baseline 比才公平。三者同批请求/同种子/同 target 模型。
+        "variants": {
+            "base": {"model": SPEC_TARGET, "cfg": dict(enable_lru=True)},
+            "base_eager": {"model": SPEC_TARGET, "enforce_eager": True, "cfg": dict(enable_lru=True)},
+            "spec": {"model": SPEC_TARGET, "cfg": dict(enable_lru=True,
+                                                       enable_speculative_decode=True,
+                                                       speculative_model=SPEC_DRAFT,
+                                                       num_speculative_tokens=int(os.environ.get("SPEC_K", "4")))},
+        },
+    },
 }
 
 
@@ -132,7 +176,11 @@ def run_variant(scenario, variant):
     sc = SCENARIOS[scenario]
     v = sc["variants"][variant]
     prompts, sps = sc["build"](**v.get("wl", {}))
-    llm = LLM(MODEL, enforce_eager=False, max_model_len=MAX_MODEL_LEN, **v.get("cfg", {}))
+    model = v.get("model", MODEL)                          # speculative 场景用较大的 target 模型
+    # enforce_eager 默认 False（走 CUDA Graph decode）。speculative 场景额外提供 base_eager 变体
+    # 关掉 Graph，做「eager-vs-eager」苹果对苹果对照：spec path 本就走 eager，只有和 eager baseline
+    # 比才隔离掉「CUDA Graph 开/关」这个巨大变量，单独衡量投机算法本身的收益。
+    llm = LLM(model, enforce_eager=v.get("enforce_eager", False), max_model_len=MAX_MODEL_LEN, **v.get("cfg", {}))
     llm.generate(["warmup"], _sp(1), use_tqdm=False)       # 预热：排除首次内核编译/CUDA Graph 捕获
     r = llm.benchmark(prompts, sps, use_tqdm=False)
     # 不显式 llm.exit()：子进程退出时 LLMEngine 注册的 atexit 会自动清理一次。
@@ -147,6 +195,21 @@ def run_variant(scenario, variant):
           f"preemptions={sched.num_preemptions}")
     print(f"prefix_cache  hit_rate={pref.hit_rate*100:.1f}%  hits={pref.num_hits}/{pref.num_queries}  "
           f"saved_tokens={pref.saved_tokens}  evictions={pref.num_evictions}")
+    if sched.num_speculative_steps:
+        # 原始量（可自行核对）：verification_steps=record_acceptance 调用数（每序列每 spec step 一次
+        # target forward）；proposed/accepted/emitted 为累计 token 数。派生：
+        #   acceptance_rate       = accepted / proposed        （被接受的 draft token 占比）
+        #   avg_accept_len        = accepted / verification     （每次真正接受的 draft token 数，0..K）
+        #   tokens_per_target_step= emitted  / verification     （每次 target forward 推进 token 数，含 bonus，1..K+1）
+        print(f"speculative  spec_steps={sched.num_speculative_steps}  verification_steps={sched.num_acceptance_records}  "
+              f"acceptance_rate={sched.acceptance_rate*100:.1f}%  avg_accept_len={sched.avg_accept_len:.2f}  "
+              f"tokens_per_target_step={sched.tokens_per_target_step:.2f}  bonus={sched.num_bonus}")
+        print(f"speculative  raw: proposed={sched.total_proposed_tokens}  "
+              f"accepted={sched.total_accepted_tokens}  emitted={sched.total_emitted_tokens}")
+        # 诊断：spec batch 装不满的限流点（各闸门累计拒绝数）+ 隐藏 fallback 步数。
+        # reject.draft 远大于其它 ⟹ draft KV 池是限流点；fallback_decode_steps>0 ⟹ 存在 target 前进/draft 冻结的降级。
+        print(f"speculative  reject: draft={sched.spec_reject_draft}  target={sched.spec_reject_target}  "
+              f"budget={sched.spec_reject_budget}  fallback_decode_steps={sched.spec_fallback_decode_steps}")
 
 
 def main():

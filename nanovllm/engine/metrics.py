@@ -15,6 +15,33 @@ class SchedulerStats:
     total_prefill_tokens: int = 0
     total_decode_tokens: int = 0
 
+    # ---------- 功能四：Speculative Decoding 统计 ----------
+    # num_speculative_steps：走 spec 路径的 step 数（一步可提交 1~K+1 个 token）。
+    # total_proposed_tokens：draft 累计 propose 的候选 token 数（= K * spec 序列数累加）。
+    # total_accepted_tokens：其中被 rejection sampling 接受的 draft token 数（不含 recovered/bonus）。
+    # total_emitted_tokens：spec 路径实际提交的 token 数（accepted + recovered/bonus），用于吞吐口径。
+    # num_bonus：全接受触发 bonus token 的次数。
+    num_speculative_steps: int = 0
+    total_proposed_tokens: int = 0
+    total_accepted_tokens: int = 0
+    total_emitted_tokens: int = 0
+    num_bonus: int = 0
+    # record_acceptance 调用次数 = 累计「序列 × spec step」的 verification 次数（一次 target forward）。
+    # avg_accept_len 的正确分母：一个 spec step 会并行验证多条序列，不能用 num_speculative_steps。
+    num_acceptance_records: int = 0
+
+    # ---------- 功能四诊断：为什么 spec batch 装不满 / draft KV lag 从哪来 ----------
+    # 每次 _select_speculative 里被拒序列按「首个失败闸门」归因，回答「首个 spec batch 为何只有 51/64」：
+    #   spec_reject_draft  —— draft KV 池装不下（几乎必然的限流点）
+    #   spec_reject_target —— target KV 池装不下
+    #   spec_reject_budget —— token 预算不足（默认 16384 下几乎不触发）
+    # spec_fallback_decode_steps：spec 开启但本步无序列能组 spec、退化为普通 decode 的步数
+    #   （>0 = 存在「target 前进、draft 冻结」的隐藏 fallback，会累积 draft KV lag —— 用来确认有没有它）。
+    spec_reject_draft: int = 0
+    spec_reject_target: int = 0
+    spec_reject_budget: int = 0
+    spec_fallback_decode_steps: int = 0
+
     def record_prefill_step(self, num_tokens: int):
         self.num_prefill_steps += 1
         self.total_prefill_tokens += num_tokens
@@ -25,6 +52,40 @@ class SchedulerStats:
 
     def record_preemption(self):
         self.num_preemptions += 1
+
+    # 记录一个 spec step 的规模：num_seqs 条序列、每条 propose 了 num_spec 个候选。
+    def record_speculative_step(self, num_seqs: int, num_spec: int):
+        self.num_speculative_steps += 1
+        self.total_proposed_tokens += num_seqs * num_spec
+
+    # 记录单条序列一次 verification 的结果：接受 accepted 个 draft token、实际提交 emitted 个 token、
+    # 是否触发 bonus。spec 提交的 token 也计入 decode 吞吐（total_decode_tokens），保证开/关口径一致。
+    def record_acceptance(self, accepted: int, emitted: int, bonus: bool):
+        self.num_acceptance_records += 1
+        self.total_accepted_tokens += accepted
+        self.total_emitted_tokens += emitted
+        self.total_decode_tokens += emitted
+        if bonus:
+            self.num_bonus += 1
+
+    @property
+    def acceptance_rate(self) -> float:
+        # 接受率 = 被接受的 draft token / 全部 propose 的 draft token；无 propose 时定义为 0。
+        return self.total_accepted_tokens / self.total_proposed_tokens if self.total_proposed_tokens else 0.0
+
+    @property
+    def avg_accept_len(self) -> float:
+        # 平均每次 verification 真正被接受的 draft token 数（不含每轮必然的 recovered/bonus），范围 0..K。
+        # 分母是 verification 次数（record_acceptance 调用数），不能用 num_speculative_steps
+        # （一个 spec step 并行验证多条序列）。这才是字面意义的 "accept length"。
+        return self.total_accepted_tokens / self.num_acceptance_records if self.num_acceptance_records else 0.0
+
+    @property
+    def tokens_per_target_step(self) -> float:
+        # 平均每次 target verification 最终推进的 token 数（= accepted + 1 个 recovered/bonus，触及
+        # max_tokens/EOS 截断时略少）——投机解码的加速上限，范围 1..K+1。与 avg_accept_len 区分：
+        # 后者只数被接受的 draft token，这里含每轮那个必然产生的 recovered/bonus token。
+        return self.total_emitted_tokens / self.num_acceptance_records if self.num_acceptance_records else 0.0
 
 
 @dataclass

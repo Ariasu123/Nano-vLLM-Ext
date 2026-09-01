@@ -12,6 +12,7 @@
 
 from collections import deque
 from time import perf_counter
+import os
 
 # Cache-Aware 调度参数：
 # _LPM_WINDOW —— 只对 waiting 前 W 个 fresh 请求打分排序，把每步开销 bound 在与队列深度无关的常量。
@@ -56,6 +57,25 @@ class Scheduler:
         self._lpm_window = _LPM_WINDOW
         self._aging_interval = _AGING_INTERVAL   # 暴露为属性，单测可调低以强制触发 aging
         self._prefill_select_calls = 0
+
+        # ---------- 功能四：Speculative Decoding ----------
+        # 关：pending_kind 恒 "normal"，不建 draft BlockManager，逐字节走原路径（零回归）。
+        # 开：无 prefill 可调度时，尝试组一个 spec step（每序列 propose K 个候选、计入 K+1 预算），
+        #     draft KV 用独立 BlockManager 管理（不做 prefix 复用/hash，enable_lru=False）。
+        self.enable_speculative_decode = getattr(config, "enable_speculative_decode", False)
+        self.num_speculative_tokens = getattr(config, "num_speculative_tokens", 4)
+        # SPEC_DIAG=1：每个 spec step 打印一行 [SPEC_SCHED]（组批规模 + 各闸门拒绝数），
+        # 用来查清「首个 spec batch 为何只有 51/64」与逐步 draft lag 走势；默认关、零开销。
+        self.spec_diag = os.environ.get("SPEC_DIAG") == "1"
+        # pending_kind 告诉 LLMEngine 本步该走哪条执行路径："normal" | "speculative"。
+        self.pending_kind = "normal"
+        self.draft_block_manager = None
+        if self.enable_speculative_decode:
+            self.draft_block_manager = BlockManager(
+                getattr(config, "num_draft_kvcache_blocks", 0),
+                config.kvcache_block_size,
+                enable_lru=False,
+            )
 
         # 调度统计，仅用于 benchmark 汇总。
         self.stats = SchedulerStats()
@@ -108,6 +128,8 @@ class Scheduler:
     # scheduled_seqs 是本轮进入 GPU 的 Sequence 列表；
     # is_prefill 告诉 ModelRunner 应准备 prompt 片段还是单个 last_token。
     def schedule(self) -> tuple[list[Sequence], bool]:
+        # 每步先复位为普通路径；仅 _select_speculative 成功组批时才改成 "speculative"。
+        self.pending_kind = "normal"
         if self.enable_chunked_prefill:
             return self._schedule_chunked()
         return self._schedule_two_phase()
@@ -163,6 +185,19 @@ class Scheduler:
         if scheduled_seqs:
             self.stats.record_prefill_step(num_batched_tokens)
             return scheduled_seqs, True
+
+        # ---------- 阶段一半：无 prefill 时优先尝试组一个 speculative step ----------
+        # 成功则本步走投机路径（pending_kind="speculative"），返回 is_prefill=False（执行路径由
+        # LLMEngine 按 pending_kind 分派，不看该布尔）；组不起来（无 running / 资源不足）则落到普通 decode。
+        if self.enable_speculative_decode:
+            spec_seqs = self._select_speculative()
+            if spec_seqs:
+                self.pending_kind = "speculative"
+                return spec_seqs, False
+            # spec 开启却组不起一个 spec step（全部序列装不下）：本步退化为普通 decode。
+            # target 会前进而 draft KV 冻结 → 下一 spec step 需补 lag。计数以确认这条隐藏 fallback 是否发生。
+            if self.running:
+                self.stats.spec_fallback_decode_steps += 1
 
         # ---------- 阶段二：没有 Prefill 时执行 Decode ----------
         # 每条 running 序列本轮只处理自己的 last_token。
@@ -269,6 +304,49 @@ class Scheduler:
         self.stats.record_decode_step(num_decode_tokens)
         return scheduled_seqs, False
 
+    # 组一个 speculative step：从 running 中挑能容纳「末 token e + K 个候选」的序列。
+    # 每条序列按 K+1 计入 token 预算；target 与 draft 双侧都要能备足 tentative 块才纳入
+    # （原子性：先 can_append_spec 双查，都过再 may_append_spec，避免只申请到一半）。
+    # 挑不满不影响正确性：未入选序列留在 running，下一步继续尝试或降级普通 decode。
+    def _select_speculative(self) -> list[Sequence]:
+        K = self.num_speculative_tokens
+        need = K + 1
+        selected = []
+        num_batched_tokens = 0
+        rej_budget = rej_target = rej_draft = 0     # 本次组批各闸门拒绝数（诊断用）
+        # 遍历当前 running 快照：逐条 popleft 判定后再 append 回队尾，一轮后顺序不变。
+        for _ in range(len(self.running)):
+            if len(selected) >= self.max_num_seqs:
+                # 已达批上限，剩余序列原样留在 running。
+                self.running.append(self.running.popleft())
+                continue
+            seq = self.running.popleft()
+            # 按短路顺序（预算 → target KV → draft KV）归因到首个失败闸门：
+            # 定位「首个 spec batch 为何只有 51/64」的确切限流点（几乎必然是 draft KV 池）。
+            if num_batched_tokens + need > self.max_num_batched_tokens:
+                rej_budget += 1
+            elif not self.block_manager.can_append_spec(seq, K):
+                rej_target += 1
+            elif not self.draft_block_manager.can_append_spec(seq, K, seq.draft_block_table):
+                rej_draft += 1
+            else:
+                self.block_manager.may_append_spec(seq, K)
+                self.draft_block_manager.may_append_spec(seq, K, seq.draft_block_table)
+                seq.is_prefill = False
+                seq.num_scheduled_tokens = need
+                num_batched_tokens += need
+                selected.append(seq)
+            self.running.append(seq)   # 无论是否入选，都留在 running
+        if selected:
+            self.stats.record_speculative_step(len(selected), K)
+        self.stats.spec_reject_budget += rej_budget
+        self.stats.spec_reject_target += rej_target
+        self.stats.spec_reject_draft += rej_draft
+        if self.spec_diag:
+            print(f"[SPEC_SCHED] running={len(self.running)} selected={len(selected)} "
+                  f"reject: draft={rej_draft} target={rej_target} budget={rej_budget}", flush=True)
+        return selected
+
     # 抢占一条请求：释放它持有的物理块，并移回 waiting 队首。
     # token_ids 不会丢失，之后可以重新 Prefill。
     def preempt(self, seq: Sequence):
@@ -276,6 +354,10 @@ class Scheduler:
         seq.is_prefill = True
         # 释放kv cache
         self.block_manager.deallocate(seq)
+        # spec 序列的 draft KV 也一并释放并清零计数：重算后由 _draft_propose 第 0 步融合补写从头重建，
+        # 避免 draft KV 与被重新 prefill 的 target 序列错位。
+        if self.draft_block_manager is not None:
+            self.draft_block_manager.deallocate_draft(seq)
         self.waiting.appendleft(seq)
         # 记录一次抢占，抢占越多说明显存压力越大（benchmark 用）。
         self.stats.record_preemption()
@@ -302,15 +384,63 @@ class Scheduler:
             if seq.num_completion_tokens == 1:
                 seq.first_token_time = perf_counter()
 
-            # 满足任一停止条件即结束：生成 EOS，或达到最大生成长度。
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
-                seq.status = SequenceStatus.FINISHED
-                # 记录请求完成时刻，供整体延迟/吞吐统计。
-                seq.finish_time = perf_counter()
+            # 满足任一停止条件即结束（EOS 或达到 max_tokens）。停止判定与善后抽成
+            # _is_stop/_finish_seq，供 postprocess_speculative 逐 token 复用同一套逻辑。
+            if self._is_stop(seq, token_id):
+                self._finish_seq(seq)
 
-                # 请求完成后立刻释放 KV Cache，供其他请求使用。
-                self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+    # 停止判据：生成 EOS（且未 ignore_eos），或已达最大生成长度。
+    def _is_stop(self, seq: Sequence, token_id: int) -> bool:
+        return (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens
+
+    # 请求结束的统一善后：打完成时刻、释放 target（及 draft）KV、移出 running。
+    def _finish_seq(self, seq: Sequence):
+        seq.status = SequenceStatus.FINISHED
+        seq.finish_time = perf_counter()
+        self.block_manager.deallocate(seq)
+        if self.draft_block_manager is not None:
+            self.draft_block_manager.deallocate_draft(seq)
+        self.running.remove(seq)
+
+    # 投机步善后：一步内一条序列提交 1~K+1 个 token。results[i] = (committed_token_ids, accept_len)。
+    # committed_token_ids 已由 rejection_sample 截到 accept_len+1 个（accepted draft + recovered/bonus）。
+    def postprocess_speculative(self, seqs: list[Sequence], results):
+        K = self.num_speculative_tokens
+        for seq, (committed, accept_len) in zip(seqs, results):
+            # 本步开始前的长度：draft propose 第 0 步融合已把 draft KV 补到 n_before-1，
+            # propose 又真实写了 K 个索引，故 draft 真实写入上界 = n_before-1+K（见下 num_draft_cached）。
+            n_before = seq.num_tokens
+            emitted = 0
+            stopped = False
+            # 逐 token 提交并复用同一套停止判定：命中即在该 token 处截断，丢弃其后 committed（off-by-one 安全）。
+            for token_id in committed:
+                seq.append_token(token_id)
+                emitted += 1
+                if seq.num_completion_tokens == 1:
+                    seq.first_token_time = perf_counter()
+                if self._is_stop(seq, token_id):
+                    stopped = True
+                    break
+            seq.num_scheduled_tokens = 0
+
+            # 接受统计：accepted 只数被接受的 draft token（=accept_len）；emitted 计入 decode 吞吐口径。
+            self.stats.record_acceptance(accepted=accept_len, emitted=emitted, bonus=(accept_len == K))
+
+            # 「末 token 不缓存」：提交后 target 缓存前进到 len-1。
+            num_written = seq.num_tokens - 1
+            seq.num_cached_tokens = num_written
+            # draft 真实已写入 KV 上界 = min(len-1, n_before-1+K)：全接受+bonus 时 dK/bonus 未写，
+            # 故 num_draft_cached 落后 1，下一步 propose 第 0 步融合补齐（反映真实写入，非纯计数）。
+            seq.num_draft_cached_tokens = min(num_written, n_before - 1 + K)
+
+            # 只登记完全提交的满块（防污染），再把双侧多余 tentative 块裁回 free。
+            self.block_manager.hash_blocks_committed(seq, num_written)
+            keep = seq.num_blocks
+            self.block_manager.trim_blocks(seq, keep)
+            self.draft_block_manager.trim_blocks(seq, keep, seq.draft_block_table)
+
+            if stopped:
+                self._finish_seq(seq)
 
     # 暴露调度统计给 LLMEngine（benchmark 汇总用）。
     def get_stats(self) -> SchedulerStats:

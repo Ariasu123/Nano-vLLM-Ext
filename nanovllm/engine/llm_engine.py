@@ -64,6 +64,18 @@ class LLMEngine:
         # EOS 是 End Of Sequence（序列结束）的缩写。
         # 当模型生成这个 token 时，Scheduler 可以把请求标记为完成。
         config.eos = self.tokenizer.eos_token_id
+
+        # 功能四：投机要求 draft/target 共用同一 token 空间。config 已断言 vocab_size 相等，
+        # 这里进一步校验 tokenizer 的 token-id 映射与特殊 token 完全一致，否则 p/q 无法对齐、
+        # 提交的 token 在两模型含义不同 → 直接报错终止（不做静默兼容）。
+        if config.enable_speculative_decode:
+            draft_tokenizer = AutoTokenizer.from_pretrained(config.speculative_model, use_fast=True)
+            assert self.tokenizer.get_vocab() == draft_tokenizer.get_vocab(), \
+                "draft/target tokenizer 词表映射不一致，无法用于投机解码"
+            for attr in ("eos_token_id", "bos_token_id", "pad_token_id"):
+                assert getattr(self.tokenizer, attr) == getattr(draft_tokenizer, attr), \
+                    f"draft/target tokenizer {attr} 不一致，无法用于投机解码"
+
         self.scheduler = Scheduler(config)
 
         # atexit.register 表示 Python 进程正常退出时自动调用 self.exit，
@@ -106,6 +118,16 @@ class LLMEngine:
     def step(self):
         # Scheduler 会返回本轮选中的序列，以及本轮走 varlen(prefill) 还是固定形状(decode) 路径。
         seqs, is_prefill = self.scheduler.schedule()
+
+        # 功能四：投机 step 走独立分派。run_speculative 一次并行 verification 提交 1~K+1 token。
+        # 计入 decode 吞吐的 token 数取本步各序列名义提交量（accept_len+1）；截断到 EOS/max_tokens
+        # 的极少数末尾差异不影响对照结论，权威口径由 metrics.total_decode_tokens 提供。
+        if self.scheduler.pending_kind == "speculative":
+            result = self.model_runner.call("run_speculative", seqs)
+            self.scheduler.postprocess_speculative(seqs, result)
+            decode_tokens = sum(accept_len + 1 for _, accept_len in result) if result else 0
+            outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+            return outputs, 0, decode_tokens
 
         # 按每条序列的 is_prefill 分别统计 prefill / decode token 数：混批步二者并存，
         # 不能再用单一符号区分。decode 序列 num_scheduled_tokens==1，prefill 序列为本步 chunk 大小。

@@ -38,6 +38,12 @@ class Context:
     # block_tables[请求下标, 逻辑块下标] = 物理块 id。
     block_tables: torch.Tensor | None = None
 
+    # ---------- 功能四：Speculative Decoding ----------
+    # return_all_logits=True 时，LM head 返回本批所有位置的 logits（而非每序列只取末位）。
+    # 仅 verification forward 置 True（需要 e,d1..dK 每个位置的 target 分布）；
+    # 普通 prefill/decode 恒 False，逐字节不改变原有「只取末位」行为（零回归）。
+    return_all_logits: bool = False
+
 # 模块级变量只创建一次，导入本模块的代码访问的是同一个对象。
 _CONTEXT = Context()
 
@@ -45,13 +51,13 @@ def get_context():
     # 返回当前全局 Context；这里不复制对象。
     return _CONTEXT
 
-def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None):
+def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None, return_all_logits=False):
     # global 告诉 Python：这里要修改模块级 _CONTEXT，而不是创建同名局部变量。
     global _CONTEXT
 
     # 每次整体创建新对象，确保 Prefill/Decode 不需要的字段恢复为默认值，
-    # 不会残留上一批的数据。
-    _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables)
+    # 不会残留上一批的数据。return_all_logits 仅投机 verification 传 True，其余默认 False（零回归）。
+    _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables, return_all_logits)
 
 def reset_context():
     global _CONTEXT

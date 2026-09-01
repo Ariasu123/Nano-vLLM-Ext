@@ -227,6 +227,18 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
+    # 释放 draft 侧 KV（draft_block_table）。draft 块本序列独占、从不 hash 共享，
+    # 直接减引用回收即可；同时清零 num_draft_cached_tokens / draft_block_table，
+    # 使抢占重算或完成后 draft 状态干净（下一次进 spec 由 _draft_propose 第 0 步融合补写从头重建）。
+    def deallocate_draft(self, seq: Sequence):
+        for block_id in reversed(seq.draft_block_table):
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+        seq.num_draft_cached_tokens = 0
+        seq.draft_block_table.clear()
+
     # 暴露 Prefix Cache 统计给上层（Scheduler → LLMEngine → benchmark）。
     def get_stats(self) -> PrefixCacheStats:
         return self.prefix_stats
@@ -264,3 +276,63 @@ class BlockManager:
 
             # 字典中同一个哈希只需保留一个物理块：
             # 相同前缀产生的 K/V 相同，后续请求共享任意一个副本即可。
+
+    # ---------- 功能四：Speculative Decoding 的块管理 ----------
+    # spec step 会试探性地为「末 token e + K 个候选 d1..dK + 可能的 bonus」写 KV，
+    # 最坏最终长度 = N + K + 1（全接受 + bonus）。这些块都是本序列独占、从不 hash 共享，
+    # 因此 commit/rollback 退化为纯管账：验证后按实际接受长度 trim 掉多余 tentative 块。
+    #
+    # 下面三个方法都接受可选 block_table 参数：target 侧传 seq.block_table（默认），
+    # draft 侧由 draft_block_manager 传 seq.draft_block_table，两个独立 BlockManager
+    # 各自管理自己的物理块池，互不干扰。num_tokens 用序列真实长度。
+
+    def _spec_target_blocks(self, num_tokens: int, num_spec: int) -> int:
+        # 覆盖最坏最终长度 N+K+1 所需的物理块数。
+        return (num_tokens + num_spec + 1 + self.block_size - 1) // self.block_size
+
+    # 检查能否为一次 spec step 备足 tentative 块（不修改状态）。
+    def can_append_spec(self, seq: Sequence, num_spec: int, block_table: "list[int] | None" = None) -> bool:
+        if block_table is None:
+            block_table = seq.block_table
+        need_new = self._spec_target_blocks(len(seq), num_spec) - len(block_table)
+        return len(self.free_block_ids) >= max(need_new, 0)
+
+    # 真正为一次 spec step 追加 tentative 块，直到覆盖最坏最终长度。
+    # 调用前必须先过 can_append_spec。这些块 hash 恒为 -1，绝不进 Prefix Cache。
+    def may_append_spec(self, seq: Sequence, num_spec: int, block_table: "list[int] | None" = None):
+        if block_table is None:
+            block_table = seq.block_table
+        target = self._spec_target_blocks(len(seq), num_spec)
+        while len(block_table) < target:
+            block_table.append(self._allocate_block())
+
+    # 验证提交后，把 block_table 裁剪到 keep_num_blocks 个逻辑块，多余 tentative 块回收。
+    # 这些块本序列独占（ref_count 从 _allocate_block 起为 1、未被 hash 共享），
+    # 减到 0 即安全归还 free 池。
+    def trim_blocks(self, seq: Sequence, keep_num_blocks: int, block_table: "list[int] | None" = None):
+        if block_table is None:
+            block_table = seq.block_table
+        while len(block_table) > keep_num_blocks:
+            block_id = block_table.pop()
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+
+    # 只把「完全落在 [0, num_written) 区间内的满块」登记进 Prefix Cache（防污染）。
+    # num_written 传 len-1（末 token 不缓存不变量）：确保绝不登记含末 token 或被拒/未写-KV
+    # token 的块。start 从「已带哈希的连续前缀块数」接续，链式哈希从前一块延续。
+    def hash_blocks_committed(self, seq: Sequence, num_written: int):
+        end = num_written // self.block_size          # 完全提交的满块个数
+        start = 0
+        while start < len(seq.block_table) and self.blocks[seq.block_table[start]].hash != -1:
+            start += 1
+        if start >= end:
+            return
+        h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
+        for i in range(start, end):
+            block = self.blocks[seq.block_table[i]]
+            token_ids = seq.block(i)
+            h = self.compute_hash(token_ids, h)
+            block.update(h, token_ids)
+            self.hash_to_block_id[h] = block.block_id

@@ -46,6 +46,16 @@ class Sequence:
         # 例：逻辑块 0、1 被分配到物理块 7、3，则 block_table == [7, 3]。
         self.block_table = []
 
+        # ---------- 功能四：Speculative Decoding ----------
+        # draft 模型独立的分页 KV：draft_block_table 是 draft KV 的逻辑->物理映射，
+        # num_draft_cached_tokens 记录 draft KV 里“真实已写入”的 token 数（必须反映真实写入，非纯计数）。
+        # 二者随 Sequence 进 pickle，供 TP 子进程构造 draft 输入张量。
+        self.draft_block_table = []
+        self.num_draft_cached_tokens = 0
+        # 本步 draft propose 的候选 token 与其分布 q，仅主进程 rank0 瞬态使用，不进 pickle。
+        self.draft_tokens = None
+        self.draft_probs = None
+
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -116,11 +126,13 @@ class Sequence:
         # Prefill 要读取 prompt 片段，因此发送 token_ids；
         # Decode 只使用 last_token，因此只发一个整数，减少通信量。
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
+        # draft_block_table / num_draft_cached_tokens 成对追加到元组末尾（陷阱3）：
+        # 关闭投机时它们是 []/0，pickle 体积几乎不变；瞬态 draft_tokens/draft_probs 不传。
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, self.draft_block_table, self.num_draft_cached_tokens)
 
     def __setstate__(self, state):
         # tuple 解包顺序必须与 __getstate__ 返回顺序完全一致。
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, self.draft_block_table, self.num_draft_cached_tokens = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

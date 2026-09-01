@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # 无卡模式阶段：装依赖 + 下模型 + 跑纯逻辑单测。全程不需要 GPU，省 GPU 计费。
-# 用法：bash setup.sh
+# 用法：在仓库根执行 bash scripts/setup.sh
 set -euo pipefail
 
-MODEL_DIR="$HOME/huggingface/Qwen3-0.6B"
+# 脚本在 scripts/ 下，切到仓库根：pip install -e . 与 pytest tests/ 都需以仓库根为工作目录。
+cd "$(dirname "$0")/.."
+source "$(dirname "$0")/env.sh"                        # 统一模型根目录（AutoDL 优先数据盘，见 env.sh）
+
+MODEL_DIR="$DRAFT_DIR"
 
 echo "==> [1/4] 安装依赖（transformers/xxhash/pytest 及模型下载工具）"
 pip install -U transformers xxhash pytest "huggingface_hub[cli]"
+# editable 安装本包：脚本已收进 scripts/，装成 editable 后从任意目录都能 import nanovllm。
+pip install -e .
 
 echo "==> [2/4] 安装 flash-attn（走镜像下官方预编译 wheel，不走源码编译）"
 
@@ -41,4 +47,4 @@ echo "==> [4/4] 跑纯逻辑单测（三项功能的调度/缓存/指标逻辑�
 python -m pytest tests/ -q
 
 echo
-echo "==> 无卡阶段完成。三份单测通过后，切到【有卡模式】执行：bash run_gpu.sh"
+echo "==> 无卡阶段完成。三份单测通过后，切到【有卡模式】执行：bash scripts/run_gpu.sh"

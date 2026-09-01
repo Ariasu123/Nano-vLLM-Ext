@@ -83,9 +83,11 @@ class ParallelLMHead(VocabParallelEmbedding):
     # 返回 rank 0 上的完整 logits: [请求数, vocab_size]。
     def forward(self, x: torch.Tensor):
         context = get_context()
-        if context.is_prefill:
+        if context.is_prefill and not context.return_all_logits:
             # Prefill 计算了 prompt 中很多位置，但生成下一个 token 只需要每条请求最后一个位置。
             # 例：cu_seqlens_q=[0,3,5]，两个末位下标是 3-1=2、5-1=4。
+            # 例外：投机 verification（return_all_logits=True）需要 e,d1..dK 每个位置的 logits，
+            # 故此时不做末位裁剪，返回全部 S*(K+1) 行，由 run_speculative reshape 成 [S,K+1,V]。
             last_indices = context.cu_seqlens_q[1:] - 1
 
             # contiguous 确保筛选后的 Tensor 在内存中连续，便于后续矩阵乘。

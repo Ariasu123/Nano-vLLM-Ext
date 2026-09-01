@@ -4,8 +4,9 @@ from transformers import AutoTokenizer
 
 
 def main():
-    # expanduser 会把路径开头的 "~" 展开成当前用户的主目录。
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    # 模型路径优先读 MODEL_DIR 环境变量（run_gpu.sh 会按 env.sh 的数据盘位置设好），
+    # 否则回退 ~/huggingface；expanduser 把开头的 "~" 展开成当前用户的主目录。
+    path = os.path.expanduser(os.environ.get("MODEL_DIR", "~/huggingface/Qwen3-0.6B/"))
     tokenizer = AutoTokenizer.from_pretrained(path)
 
     # 创建推理引擎时会完成较重的初始化工作：

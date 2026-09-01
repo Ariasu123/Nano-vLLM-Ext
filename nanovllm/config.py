@@ -35,6 +35,16 @@ class Config:
     # 聚拢，减少热点前缀被无关请求挤出缓存后的重复 prefill；配合 aging 阈值防止低命中请求饿死。
     enable_cache_aware_schedule: bool = False
 
+    # ---------- 功能四：Draft-Target Speculative Decoding（投机解码）----------
+    # 默认关=完全走原 decode 路径，不构建 draft 模型/KV，零回归。
+    # 打开后用小 draft 模型连续 propose K 个候选 token，大 target 模型一次并行 verification，
+    # 通过 Exact Rejection Sampling 决定接受长度，使一个 target step 推进 1~K+1 个 token。
+    enable_speculative_decode: bool = False
+    speculative_model: "str | None" = None    # draft 模型本地目录（需与 target 共享同一 tokenizer/vocab）
+    num_speculative_tokens: int = 1            # 每步 draft propose 的候选 token 数 K（默认 1：融合后满批 64 eager 下 wall/TPOT/吞吐全指标最优；higher-K 需 draft-decode CUDA Graph 摊薄 draft forward 才有收益）
+    draft_hf_config: "AutoConfig | None" = None  # draft 模型 config，若开启则在 __post_init__ 懒加载
+    num_draft_kvcache_blocks: int = -1         # draft KV Cache 块数，ModelRunner 预热后计算
+
     # 数据类完成自动 __init__ 后，会自动调用 __post_init__ 做校验和补充初始化。
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -48,3 +58,13 @@ class Config:
 
         # 最终长度取“用户限制”和“模型本身上限”中的较小值。
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+
+        # 功能四：开启投机时懒加载 draft config，并做 hf_config 级别的 vocab_size 断言
+        # （token 空间必须一致，否则 rejection sampling 的 p/q 无法对齐）。
+        # tokenizer 层面的 token-id 映射与特殊 token 一致性由 LLMEngine 加载 tokenizer 后校验。
+        if self.enable_speculative_decode:
+            assert self.speculative_model is not None and os.path.isdir(self.speculative_model)
+            assert self.num_speculative_tokens >= 1
+            self.draft_hf_config = AutoConfig.from_pretrained(self.speculative_model)
+            assert self.draft_hf_config.vocab_size == self.hf_config.vocab_size, \
+                f"draft/target vocab_size 不一致: {self.draft_hf_config.vocab_size} vs {self.hf_config.vocab_size}"
